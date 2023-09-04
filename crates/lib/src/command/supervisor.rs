@@ -14,7 +14,8 @@ use watchexec_events::{Event, Priority, Source, Tag};
 use watchexec_signals::Signal;
 
 use crate::{
-	action::{PostSpawn, PreSpawn},
+	action::PreSpawn,
+	changeable::ChangeableFn,
 	command::{Command, Isolation, Program},
 	error::RuntimeError,
 	Config,
@@ -55,21 +56,24 @@ pub struct Args {
 	pub supervisor_id: SupervisorId,
 	/// The [`Event`]s associated with the [`Supervisor`].
 	pub actioned_events: Arc<[Event]>,
+	/// A custom pre_spawn handler.
+	pub pre_spawn_handler: Option<ChangeableFn<PreSpawn>>,
 }
 
 impl Supervisor {
 	/// Spawns the command set, the supervisor task from the provided arguments and returns a new
 	/// control object.
-	pub fn spawn(args: Args) -> Result<Self, RuntimeError> {
-		let Args {
+	pub fn spawn(
+		Args {
 			config,
 			errors,
 			events,
 			mut command,
 			supervisor_id,
 			actioned_events,
-		} = args;
-
+			pre_spawn_handler,
+		}: Args,
+	) -> Result<Self, RuntimeError> {
 		let program = command
 			.sequence
 			.pop_front()
@@ -88,10 +92,12 @@ impl Supervisor {
 			loop {
 				let (mut process, pid) = match span.in_scope(|| {
 					spawn_process(
-						config.clone(),
 						program,
 						supervisor_id,
 						command.isolation,
+						pre_spawn_handler
+							.as_ref()
+							.unwrap_or(&config.pre_spawn_handler),
 						actioned_events.clone(),
 					)
 				}) {
@@ -291,10 +297,10 @@ impl Supervisor {
 }
 
 fn spawn_process(
-	config: Arc<Config>,
 	program: Program,
 	supervisor_id: SupervisorId,
 	isolation: Isolation,
+	pre_spawn_handler: &ChangeableFn<PreSpawn>,
 	actioned_events: Arc<[Event]>,
 ) -> Result<(Process, u32), RuntimeError> {
 	debug!(?isolation, ?program, "preparing program");
@@ -323,13 +329,13 @@ fn spawn_process(
 
 	debug!("running pre-spawn handler");
 	let (payload, command) = PreSpawn::new(
-		program.clone(),
+		program,
 		isolation,
 		spawnable,
-		actioned_events.clone(),
+		actioned_events,
 		supervisor_id,
 	);
-	config.pre_spawn_handler.call(payload);
+	pre_spawn_handler.call(payload);
 
 	debug!("pre-spawn handler done, obtaining command");
 	let mut spawnable = Arc::into_inner(command)
@@ -365,16 +371,6 @@ fn spawn_process(
 			(Process::Ungrouped(proc), id)
 		}
 	};
-
-	debug!("running post-spawn handler");
-	config.post_spawn_handler.call(PostSpawn {
-		program,
-		isolation,
-		events: actioned_events,
-		id,
-		supervisor_id,
-	});
-	debug!("done with post-spawn handler");
 
 	Ok((proc, id))
 }
